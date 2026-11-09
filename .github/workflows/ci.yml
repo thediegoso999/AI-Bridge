@@ -1,4 +1,4 @@
-﻿name: AI Development Hub
+﻿name: AI-Bridge CI
 
 on:
   push:
@@ -11,6 +11,7 @@ permissions:
 jobs:
   verificar:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     steps:
       - name: Obtener codigo
@@ -22,12 +23,24 @@ jobs:
           python-version: "3.11"
 
       - name: Comprobar sintaxis
-        run: python -m compileall -q .
+        run: python -m compileall -q aibridge tests
 
       - name: Ejecutar pruebas
         run: |
-          if [ -d tests ]; then
-            python -m unittest discover -s tests -v
-          else
-            echo "No hay pruebas configuradas."
-          fi
+          python - <<'PY'
+          import sys
+          import unittest
+          from pathlib import Path
+
+          if not Path("tests").is_dir():
+              raise SystemExit("No existe el directorio tests/.")
+
+          suite = unittest.defaultTestLoader.discover("tests", pattern="test*.py")
+          test_count = suite.countTestCases()
+          if test_count == 0:
+              raise SystemExit("No se encontraron pruebas unittest.")
+
+          print(f"Pruebas encontradas: {test_count}")
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          sys.exit(not result.wasSuccessful())
+          PY
