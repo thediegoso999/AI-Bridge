@@ -18,8 +18,16 @@ from aibridge.providers import (
     ProviderError,
     ProviderStatus,
     configure_free_providers,
+    model_route_id,
+    provider_request_timeout,
 )
-from aibridge.router import ProviderHealth, RouterSettings, classify_task, rank_providers
+from aibridge.router import (
+    MAX_FALLBACK_ROUTES,
+    ProviderHealth,
+    RouterSettings,
+    classify_task,
+    rank_providers,
+)
 from aibridge.smart_router import SmartTaskEngine, SmartTaskStore
 from aibridge.dashboard import create_server
 
@@ -106,13 +114,19 @@ class SmartRouterTests(unittest.TestCase):
                 "capabilities": ("image",),
             }
         )
+        paid = ProviderStatus(
+            **{
+                **provider_status("paid").__dict__,
+                "free_only": False,
+            }
+        )
         candidates = rank_providers(
             "Analyze the design tradeoffs",
-            (limited_context, capable, no_text, backup),
+            (limited_context, capable, no_text, paid, backup),
             RouterSettings(
                 mode="manual",
                 manual_provider_id="preferred",
-                enabled_provider_ids=("small", "preferred", "not-text", "backup"),
+                enabled_provider_ids=("small", "preferred", "not-text", "paid", "backup"),
             ),
             {"preferred": ProviderHealth()},
             now=0,
@@ -165,7 +179,10 @@ class SmartRouterTests(unittest.TestCase):
             task.id, provider_ids=["first"], external_consent=True
         )
         self.assertEqual(approved.status, "approved")
-        self.assertEqual(approved.allowed_provider_ids, ("first",))
+        self.assertEqual(
+            approved.allowed_provider_ids,
+            (model_route_id("first", "first-test-model"),),
+        )
         self.assertEqual(provider.calls, [])
 
         self.assertTrue(engine.run_next_task())
@@ -238,12 +255,71 @@ class SmartRouterTests(unittest.TestCase):
         self.assertEqual(engine.store.get(task.id).status, "failed")
         self.assertEqual(untouched.calls, [])
 
+    def test_safety_rejection_does_not_fall_back_and_empty_text_is_not_completed(self):
+        safety = FakeProvider(
+            "first", ProviderError("blocked by safety policy", kind="safety_rejection")
+        )
+        untouched = FakeProvider("second", "must not run")
+        engine = self.make_engine(
+            {"first": safety, "second": untouched},
+            [provider_status("first"), provider_status("second")],
+        )
+        task = engine.create_task("Do not bypass a safety restriction")
+        engine.approve_task(
+            task.id,
+            provider_ids=["first", "second"],
+            external_consent=True,
+        )
+        engine.run_next_task()
+        stored = engine.store.get(task.id)
+        self.assertEqual(stored.status, "failed")
+        self.assertIn("safety_rejection", stored.error)
+        self.assertEqual(untouched.calls, [])
+
+        empty = FakeProvider("first", "")
+        backup = FakeProvider("second", "valid response")
+        engine = self.make_engine(
+            {"first": empty, "second": backup},
+            [provider_status("first"), provider_status("second")],
+        )
+        task = engine.create_task("Reject empty provider output")
+        engine.approve_task(
+            task.id,
+            provider_ids=["first", "second"],
+            external_consent=True,
+        )
+        engine.run_next_task()
+        stored = engine.store.get(task.id)
+        self.assertEqual(stored.status, "completed")
+        self.assertEqual(stored.result, "valid response")
+        self.assertEqual(empty.calls, [task.instruction])
+
+        store = SmartTaskStore(self.database_path)
+        pending = store.create("Store must reject empty completion")
+        store.approve(pending.id, ["first"], external_consent=True)
+        running = store.claim_next()
+        self.assertIsNotNone(running)
+        with self.assertRaises(TaskValidationError):
+            store.complete(running.id)
+
     def test_all_providers_failing_preserves_task_for_explicit_retry(self):
         first = FakeProvider("first", ProviderError("temporary", kind="transient"))
         second = FakeProvider("second", ProviderError("unavailable", kind="transient"))
+        unapproved = FakeProvider("unapproved", "must not run")
+        unavailable_status = ProviderStatus(
+            **{
+                **provider_status("unavailable", enabled=False).__dict__,
+                "message": "Falta la clave API.",
+            }
+        )
         engine = self.make_engine(
-            {"first": first, "second": second},
-            [provider_status("first"), provider_status("second")],
+            {"first": first, "second": second, "unapproved": unapproved},
+            [
+                provider_status("first"),
+                provider_status("second"),
+                provider_status("unapproved"),
+                unavailable_status,
+            ],
         )
         task = engine.create_task("Retry later")
         engine.approve_task(
@@ -254,11 +330,190 @@ class SmartRouterTests(unittest.TestCase):
         stored = engine.store.get(task.id)
         self.assertEqual(stored.status, "failed")
         self.assertIn("unavailable", stored.error)
+        self.assertIn("Diagnóstico de rutas aprobadas:", stored.error)
+        self.assertIn("first (first-test-model): transient", stored.error)
+        self.assertIn("second (second-test-model): transient", stored.error)
+        self.assertIn("unapproved (unapproved-test-model)", stored.error)
+        self.assertIn("no autorizada para esta tarea", stored.error)
+        self.assertIn("unavailable (unavailable-test-model): Falta la clave API.", stored.error)
+        self.assertEqual(unapproved.calls, [])
         self.assertEqual(len(engine.store.attempt_history()), 2)
+
+    def test_falls_back_between_models_within_one_provider(self):
+        first_model = "openai/gpt-oss-20b"
+        second_model = "openai/gpt-oss-120b"
+        first = FakeProvider(
+            "groq",
+            ProviderError("temporary model failure", kind="transient"),
+        )
+        second = FakeProvider("groq", "second model response")
+        providers = {
+            model_route_id("groq", first_model): first,
+            model_route_id("groq", second_model): second,
+        }
+        statuses = [
+            provider_status("groq", model=first_model),
+            provider_status("groq", model=second_model),
+        ]
+        engine = self.make_engine(providers, statuses)
+        task = engine.create_task("Try registered Groq models")
+        plan = engine.route_plan(task.instruction)
+        engine.approve_task(
+            task.id,
+            provider_ids=[candidate.route_id for candidate in plan],
+            external_consent=True,
+        )
+
+        engine.run_next_task()
+
+        stored = engine.store.get(task.id)
+        self.assertEqual(stored.status, "completed")
+        self.assertEqual(stored.result, "second model response")
+        self.assertEqual(stored.provider_id, "groq")
+        self.assertEqual(stored.selected_model, second_model)
+        self.assertEqual(len(first.calls), 1)
+        self.assertEqual(len(second.calls), 1)
+        self.assertEqual(len(engine.store.attempt_history()), 2)
+
+    def test_three_failed_model_routes_fall_back_to_the_fourth_without_looping(self):
+        groq_first = "openai/gpt-oss-20b"
+        groq_second = "openai/gpt-oss-120b"
+        gemini_model = "gemini-3.8-flash"
+        cloudflare_model = "@cf/meta/llama-3.2-1b-instruct"
+        route_outcomes = (
+            ("groq", groq_first, ProviderError("one", kind="transient")),
+            ("groq", groq_second, ProviderError("two", kind="transient")),
+            ("gemini", gemini_model, ProviderError("three", kind="transient")),
+            ("cloudflare", cloudflare_model, "fourth model response"),
+        )
+        providers = {
+            model_route_id(provider_id, model): FakeProvider(provider_id, outcome)
+            for provider_id, model, outcome in route_outcomes
+        }
+        statuses = [
+            provider_status(provider_id, model=model)
+            for provider_id, model, _outcome in route_outcomes
+        ]
+        engine = self.make_engine(providers, statuses)
+        engine.store.save_router_settings(
+            RouterSettings(
+                enabled_provider_ids=("groq", "gemini", "cloudflare"),
+                priorities={"groq": 10, "gemini": 9, "cloudflare": 8},
+            )
+        )
+        task = engine.create_task("Try four model routes")
+        plan = engine.route_plan(task.instruction)
+        self.assertEqual(
+            [candidate.route_id for candidate in plan],
+            [model_route_id(*entry[:2]) for entry in route_outcomes],
+        )
+        engine.approve_task(
+            task.id,
+            provider_ids=[candidate.route_id for candidate in plan],
+            external_consent=True,
+        )
+
+        engine.run_next_task()
+
+        stored = engine.store.get(task.id)
+        self.assertEqual(stored.status, "completed")
+        self.assertEqual(stored.result, "fourth model response")
+        self.assertEqual(stored.selected_model, cloudflare_model)
+        self.assertEqual(
+            [len(providers[model_route_id(*entry[:2])].calls) for entry in route_outcomes],
+            [1, 1, 1, 1],
+        )
+        attempts = engine.store.attempt_history()
+        self.assertEqual(len(attempts), 4)
+        self.assertEqual(
+            [attempt["model"] for attempt in reversed(attempts)],
+            [entry[1] for entry in route_outcomes],
+        )
+
+    def test_groq_cloudflare_1010_blocks_groq_routes_and_falls_back_to_approved_route(self):
+        first_model = "openai/gpt-oss-20b"
+        blocked_sibling_model = "openai/gpt-oss-120b"
+        backup_model = "gemini-3.8-flash"
+        groq = GroqProvider("secret", first_model)
+        blocked_sibling = FakeProvider("groq", "must not be attempted")
+        backup = FakeProvider("gemini", "fallback after access block")
+        providers = {
+            model_route_id("groq", first_model): groq,
+            model_route_id("groq", blocked_sibling_model): blocked_sibling,
+            model_route_id("gemini", backup_model): backup,
+        }
+        statuses = [
+            provider_status("groq", model=first_model),
+            provider_status("groq", model=blocked_sibling_model),
+            provider_status("gemini", model=backup_model),
+        ]
+        engine = self.make_engine(providers, statuses)
+        engine.store.save_router_settings(
+            RouterSettings(
+                enabled_provider_ids=("groq", "gemini"),
+                priorities={"groq": 10, "gemini": 9},
+            )
+        )
+        task = engine.create_task("Use another approved provider after access block")
+        plan = engine.route_plan(task.instruction)
+        engine.approve_task(
+            task.id,
+            provider_ids=[candidate.route_id for candidate in plan],
+            external_consent=True,
+        )
+        access_error = HTTPError(
+            "https://api.groq.com/openai/v1/chat/completions",
+            403,
+            "Forbidden",
+            {},
+            BytesIO(b"<html>Cloudflare error 1010</html>"),
+        )
+        with patch("aibridge.providers.urlopen", side_effect=access_error):
+            engine.run_next_task()
+
+        stored = engine.store.get(task.id)
+        self.assertEqual(stored.status, "completed")
+        self.assertEqual(stored.provider_id, "gemini")
+        self.assertEqual(stored.result, "fallback after access block")
+        self.assertEqual(blocked_sibling.calls, [])
+        self.assertEqual(backup.calls, [task.instruction])
+        failed_attempt = next(
+            attempt
+            for attempt in engine.store.attempt_history()
+            if attempt["outcome"] == "failed"
+        )
+        self.assertEqual(failed_attempt["provider_id"], "groq")
+        self.assertEqual(failed_attempt["model"], first_model)
+        self.assertIn("access_blocked", failed_attempt["reason"])
+        groq_status = next(
+            provider for provider in engine.public_status()["providers"]
+            if provider["id"] == "groq"
+        )
+        self.assertFalse(groq_status["enabled"])
+
+    def test_model_route_fallback_has_a_fixed_bound(self):
+        self.assertEqual(MAX_FALLBACK_ROUTES, 8)
+        models = [f"verified-test-model-{index}" for index in range(10)]
+        statuses = [
+            provider_status("one", model=model)
+            for model in models
+        ]
+        candidates = rank_providers(
+            "Try a bounded set",
+            statuses,
+            RouterSettings(enabled_provider_ids=("one",)),
+            {},
+            now=0,
+        )
+        self.assertEqual(len(candidates), MAX_FALLBACK_ROUTES)
+        self.assertEqual(len({candidate.route_id for candidate in candidates}), 8)
 
     def test_credentials_error_disables_provider_and_does_not_fallback(self):
         invalid_key = FakeProvider(
-            "first", ProviderError("unauthorized", kind="credentials", http_status=401)
+            "first",
+            ProviderError(
+                "api-key-sentinel unauthorized", kind="credentials", http_status=401
+            ),
         )
         second = FakeProvider("second", "no fallback")
         engine = self.make_engine(
@@ -274,7 +529,32 @@ class SmartRouterTests(unittest.TestCase):
         first_status = next(item for item in state["providers"] if item["id"] == "first")
         self.assertFalse(first_status["configured"])
         self.assertFalse(first_status["enabled"])
+        self.assertNotIn("api-key-sentinel", engine.store.get(task.id).error)
+        self.assertIn(
+            "second::second-test-model: no intentado por la política de credenciales",
+            engine.store.get(task.id).error,
+        )
+        self.assertNotIn("api-key-sentinel", state["attempts"][0]["reason"])
+        self.assertNotIn("api-key-sentinel", state["health"][0]["last_error"])
         self.assertEqual(second.calls, [])
+
+    def test_paid_provider_is_blocked_even_if_a_stale_task_authorizes_it(self):
+        paid = FakeProvider("paid", "must not run")
+        paid_status = ProviderStatus(
+            **{
+                **provider_status("paid").__dict__,
+                "free_only": False,
+            }
+        )
+        engine = self.make_engine({"paid": paid}, [paid_status])
+        task = engine.create_task("Do not send to a paid route")
+        engine.store.approve(task.id, ["paid"], external_consent=True)
+        engine.run_next_task()
+
+        stored = engine.store.get(task.id)
+        self.assertEqual(stored.status, "failed")
+        self.assertIn("bloqueado por FREE_ONLY", stored.error)
+        self.assertEqual(paid.calls, [])
 
     def test_paid_or_unverified_models_are_disabled_by_default(self):
         config = configure_free_providers(
@@ -311,7 +591,12 @@ class SmartRouterTests(unittest.TestCase):
         }
         config = configure_free_providers(env)
         self.assertEqual(
-            set(config.providers), {"gemini", "groq", "openrouter"}
+            set(config.providers),
+            {
+                model_route_id("gemini", "gemini-3.8-flash"),
+                model_route_id("groq", "openai/gpt-oss-20b"),
+                model_route_id("openrouter", "openrouter/free"),
+            },
         )
         statuses = {status.identifier: status for status in config.statuses}
         self.assertFalse(statuses["cloudflare"].enabled)
@@ -320,6 +605,35 @@ class SmartRouterTests(unittest.TestCase):
         self.assertEqual(statuses["groq"].context_window_tokens, 131_072)
         self.assertIn("reasoning", statuses["gemini"].capabilities)
         self.assertNotIn("gemini-key", json.dumps(config.statuses, default=lambda item: item.__dict__))
+
+    def test_free_model_registry_allows_multiple_registered_models_per_provider(self):
+        config = configure_free_providers(
+            {
+                "GROQ_API_KEY": "groq-key",
+                "AI_BRIDGE_GROQ_FREE_TIER_CONFIRMED": "true",
+                "AI_BRIDGE_GROQ_MODELS": (
+                    "openai/gpt-oss-20b,openai/gpt-oss-120b,provider/unverified"
+                ),
+            }
+        )
+        self.assertEqual(
+            set(config.providers),
+            {
+                model_route_id("groq", "openai/gpt-oss-20b"),
+                model_route_id("groq", "openai/gpt-oss-120b"),
+            },
+        )
+        groq_statuses = [
+            status for status in config.statuses if status.identifier == "groq"
+        ]
+        self.assertEqual(len(groq_statuses), 3)
+        self.assertEqual(
+            sum(status.enabled for status in groq_statuses),
+            2,
+        )
+        unverified = next(status for status in groq_statuses if not status.free_only)
+        self.assertFalse(unverified.enabled)
+        self.assertIsNone(unverified.model)
 
     def test_interrupted_tasks_are_failed_not_replayed_and_history_survives(self):
         provider = FakeProvider("first", "unused")
@@ -412,7 +726,13 @@ class SmartRouterTests(unittest.TestCase):
         self.assertEqual(engine.store.get(task.id).status, "awaiting_approval")
 
     def test_http_statuses_are_classified_for_bounded_fallback(self):
-        cases = ((429, "rate_limited"), (503, "transient"), (401, "credentials"), (400, "invalid_request"))
+        cases = (
+            (429, "rate_limited"),
+            (503, "transient"),
+            (401, "credentials"),
+            (403, "access_blocked"),
+            (400, "invalid_request"),
+        )
         for status_code, expected_kind in cases:
             with self.subTest(status=status_code):
                 error = HTTPError(
@@ -428,6 +748,17 @@ class SmartRouterTests(unittest.TestCase):
 
                         GeminiProvider("key", "gemini-3.8-flash").generate("hello")
                 self.assertEqual(raised.exception.kind, expected_kind)
+
+    def test_provider_request_timeout_is_bounded_by_remaining_task_time(self):
+        response_body = json.dumps(
+            {"candidates": [{"content": {"parts": [{"text": "gemini"}]}}]}
+        ).encode()
+        with patch(
+            "aibridge.providers.urlopen", return_value=BytesIO(response_body)
+        ) as mocked_urlopen:
+            with provider_request_timeout(2.5):
+                GeminiProvider("secret", "gemini-3.8-flash").generate("hello")
+        self.assertEqual(mocked_urlopen.call_args.kwargs["timeout"], 2.5)
 
     def test_new_connectors_use_official_fixed_endpoints_and_keep_keys_out_of_payload(self):
         responses = (
@@ -477,6 +808,8 @@ class SmartRouterTests(unittest.TestCase):
                     "aibridge.providers.urlopen", return_value=FakeResponse(payload)
                 ) as mocked_urlopen:
                     self.assertTrue(provider.generate("hello"))
+                if provider.identifier == "openrouter":
+                    self.assertEqual(provider.selected_model, "openrouter/free")
                 request = mocked_urlopen.call_args.args[0]
                 self.assertEqual(request.full_url, endpoint)
                 self.assertNotIn("secret", request.data.decode())
@@ -585,6 +918,10 @@ class SmartRouterDashboardSecurityTests(unittest.TestCase):
             plan = json.loads(response.read())
         self.assertEqual(plan["task_type"], "reasoning")
         self.assertEqual(plan["candidates"][0]["provider_id"], "gemini")
+        self.assertEqual(
+            plan["candidates"][0]["route_id"],
+            model_route_id("gemini", "gemini-3.8-flash"),
+        )
         with self.post_json(
             "/api/agents/router",
             {
@@ -644,7 +981,10 @@ class SmartRouterDashboardSecurityTests(unittest.TestCase):
             approved = json.loads(response.read())["task"]
             self.assertEqual(response.status, 202)
         self.assertEqual(approved["status"], "approved")
-        self.assertEqual(approved["allowed_provider_ids"], ["gemini"])
+        self.assertEqual(
+            approved["allowed_provider_ids"],
+            [model_route_id("gemini", "gemini-3.8-flash")],
+        )
         for _ in range(50):
             if self.engine.store.get(task["id"]).status == "completed":
                 break

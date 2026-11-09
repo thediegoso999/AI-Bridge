@@ -368,7 +368,7 @@ function renderAgentTasks(tasks) {
 
 function renderRouter(data) {
   const providers = Array.isArray(data.providers) ? data.providers : [];
-  const health = new Map((data.health || []).map((item) => [item.provider_id, item]));
+  const health = new Map((data.health || []).map((item) => [item.route_id, item]));
   const settings = data.settings || {};
   const enabledIds = Array.isArray(settings.enabled_provider_ids)
     ? settings.enabled_provider_ids
@@ -432,16 +432,21 @@ function renderRouter(data) {
 
       const model = document.createElement("span");
       model.className = "router-provider-model";
-      const providerHealth = health.get(provider.id);
-      const availability = providerHealth
-        ? providerHealth.state === "cooldown"
-          ? `cooldown · retry in ${providerHealth.retry_after_seconds}s`
-          : providerHealth.state
-        : provider.availability || "unknown";
-      const contextWindow = provider.context_window_tokens
-        ? `${provider.context_window_tokens.toLocaleString()} tokens`
-        : "not verified";
-      model.textContent = `Model: ${provider.model || "not verified"} · Capabilities: ${(provider.capabilities || ["text"]).join(", ")} · Context: ${contextWindow} · State: ${availability}`;
+      const registeredModels = (provider.models || []).map((entry) => {
+        const providerHealth = health.get(entry.route_id);
+        const availability = providerHealth
+          ? providerHealth.state === "cooldown"
+            ? `cooldown · retry in ${providerHealth.retry_after_seconds}s`
+            : providerHealth.state
+          : entry.availability || "unknown";
+        const contextWindow = entry.context_window_tokens
+          ? `${entry.context_window_tokens.toLocaleString()} tokens`
+          : "context not verified";
+        const modelName = entry.model || "model not verified";
+        const limits = `${entry.max_output_tokens} output tokens max · ${entry.local_daily_request_limit} requests / ${entry.local_daily_token_limit.toLocaleString()} estimated tokens daily`;
+        return `${modelName} · ${(entry.capabilities || ["text"]).join(", ")} · ${contextWindow} · ${limits} · ${availability}`;
+      });
+      model.textContent = `Models: ${registeredModels.join(" | ") || provider.model || "not verified"}`;
       const details = document.createElement("span");
       details.className = `router-provider-note ${provider.eligible ?? provider.configured ? "" : "is-error"}`;
       details.textContent = `${provider.message} ${provider.quota || ""} Local today: ${provider.local_requests_today || 0} requests / ${provider.local_estimated_tokens_today || 0} estimated tokens${provider.id === "cloudflare" ? ` / ${provider.local_estimated_neurons_today || 0} estimated neurons` : ""}.`;
@@ -598,7 +603,7 @@ async function approveAgentTask(task) {
         "X-CSRF-Token": state.agentCsrfToken,
       },
       body: JSON.stringify({
-        provider_ids: candidates.map((candidate) => candidate.provider_id),
+        provider_ids: candidates.map((candidate) => candidate.route_id),
         external_consent: true,
       }),
     });

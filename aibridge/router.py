@@ -7,6 +7,7 @@ from typing import Mapping, Sequence
 from aibridge.providers import ProviderStatus
 
 MAX_FALLBACK_PROVIDERS = 3
+MAX_FALLBACK_ROUTES = 8
 MAX_TASK_SECONDS = 60
 PROVIDER_COOLDOWN_SECONDS = 60
 LOCAL_DAILY_REQUEST_LIMIT = 20
@@ -77,6 +78,10 @@ class RouteCandidate:
     score: float
     explanation: str
 
+    @property
+    def route_id(self) -> str:
+        return f"{self.provider_id}::{self.model}"
+
 
 def classify_task(instruction: str) -> str:
     """Return a heuristic label for display; it is not a quality judgement."""
@@ -128,7 +133,7 @@ def rank_providers(
     usage = usage or {}
     candidates: list[RouteCandidate] = []
     for status in statuses:
-        if not status.enabled or status.simulation:
+        if not status.enabled or not status.free_only or status.simulation:
             continue
         if status.identifier not in enabled_ids:
             continue
@@ -140,7 +145,7 @@ def rank_providers(
             > status.context_window_tokens
         ):
             continue
-        state = health.get(status.identifier, ProviderHealth())
+        state = health.get(status.route_id, health.get(status.identifier, ProviderHealth()))
         if state.available_at > now:
             continue
         requests, tokens = usage.get(status.identifier, (0, 0))
@@ -188,12 +193,31 @@ def rank_providers(
             candidate.provider_id,
         )
     )
-    return candidates[:MAX_FALLBACK_PROVIDERS]
+    routes: list[RouteCandidate] = []
+    provider_ids: set[str] = set()
+    route_ids: set[str] = set()
+    for candidate in candidates:
+        route_id = f"{candidate.provider_id}::{candidate.model}"
+        if route_id in route_ids:
+            continue
+        if (
+            candidate.provider_id not in provider_ids
+            and len(provider_ids) >= MAX_FALLBACK_PROVIDERS
+        ):
+            continue
+        routes.append(candidate)
+        provider_ids.add(candidate.provider_id)
+        route_ids.add(route_id)
+        if len(routes) >= MAX_FALLBACK_ROUTES:
+            break
+    return routes
 
 
 def fallback_reason(provider_id: str, error_kind: str) -> str:
     """Return a sanitized, user-facing explanation for a retry decision."""
     labels = {
+        "access_blocked": "bloqueo de acceso; se suspende esta ruta",
+        "invalid_response": "respuesta técnica no válida",
         "rate_limited": "límite temporal (HTTP 429)",
         "transient": "fallo temporal o timeout",
         "model_unavailable": "modelo no disponible",
@@ -205,7 +229,11 @@ def public_health(health: Mapping[str, ProviderHealth]) -> list[dict[str, object
     now = time.monotonic()
     return [
         {
-            "provider_id": provider_id,
+            "route_id": provider_id,
+            "provider_id": provider_id.split("::", 1)[0],
+            "model": provider_id.split("::", 1)[1]
+            if "::" in provider_id
+            else None,
             "available": state.available_at <= now,
             "state": "cooldown" if state.available_at > now else "available",
             "retry_after_seconds": max(0, int(state.available_at - now)),

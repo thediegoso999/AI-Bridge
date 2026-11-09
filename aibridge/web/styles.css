@@ -173,7 +173,7 @@ h2 { margin: 7px 0 0; font: 400 20px/1.2 Georgia, "Times New Roman", serif; lett
 .agent-task-heading strong { color: var(--ink-soft); font: 10px ui-monospace, monospace; }
 .agent-task-prompt { margin: 10px 0; color: var(--ink); font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
 .agent-task-result { max-height: 280px; overflow: auto; margin: 10px 0; padding: 12px; background: #f0f3ee; color: var(--ink-soft); font: 11px/1.6 ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
-.agent-task-error { margin: 8px 0; color: var(--red); font-size: 11px; line-height: 1.5; }
+.agent-task-error { margin: 8px 0; color: var(--red); font-size: 11px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
 .agent-task .logs-button { margin-top: 4px; }
 .agent-task .run-meta { margin-top: 8px; }
 .agent-task .run-state { text-transform: capitalize; }

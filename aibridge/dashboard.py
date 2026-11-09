@@ -165,7 +165,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     200,
                     {
                         "task_type": classify_task(instruction.strip()),
-                        "candidates": [asdict(candidate) for candidate in plan],
+                        "candidates": [
+                            {**asdict(candidate), "route_id": candidate.route_id}
+                            for candidate in plan
+                        ],
                     },
                 )
                 return

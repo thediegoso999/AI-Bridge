@@ -26,12 +26,15 @@ from aibridge.providers import (
     ProviderError,
     ProviderStatus,
     configure_free_providers,
+    model_route_id,
+    provider_request_timeout,
 )
 from aibridge.router import (
     LOCAL_DAILY_REQUEST_LIMIT,
     LOCAL_DAILY_TOKEN_LIMIT,
     MAX_ESTIMATED_OUTPUT_TOKENS,
     MAX_FALLBACK_PROVIDERS,
+    MAX_FALLBACK_ROUTES,
     MAX_TASK_SECONDS,
     PROVIDER_COOLDOWN_SECONDS,
     ProviderHealth,
@@ -229,7 +232,7 @@ class SmartTaskStore:
                 WHERE id = ? AND status IN ('awaiting_approval', 'failed')
                 """,
                 (
-                    provider_ids[0],
+                    provider_ids[0].split("::", 1)[0],
                     json.dumps(list(provider_ids)),
                     int(external_consent),
                     now,
@@ -288,6 +291,10 @@ class SmartTaskStore:
         provider_id: str | None = None,
         model: str | None = None,
     ) -> SmartTask:
+        if error is None and (not isinstance(result, str) or not result.strip()):
+            raise TaskValidationError(
+                "Una tarea solo puede completarse con una respuesta de texto válida."
+            )
         status = "completed" if error is None else "failed"
         with closing(self._connect()) as connection, connection:
             cursor = connection.execute(
@@ -474,7 +481,8 @@ class SmartTaskEngine:
         self._worker: threading.Thread | None = None
         self.store.recover_interrupted()
         for attempt in reversed(self.store.attempt_history()):
-            state = self.health.setdefault(attempt["provider_id"], ProviderHealth())
+            route_id = model_route_id(attempt["provider_id"], attempt["model"])
+            state = self.health.setdefault(route_id, ProviderHealth())
             if attempt["outcome"] == "completed":
                 state.successes += 1
                 state.latency_ms = float(attempt["latency_ms"])
@@ -486,7 +494,11 @@ class SmartTaskEngine:
             self.store.save_router_settings(
                 RouterSettings(
                     enabled_provider_ids=tuple(
-                        status.identifier for status in statuses if status.enabled
+                        dict.fromkeys(
+                            status.identifier
+                            for status in statuses
+                            if status.enabled and status.free_only
+                        )
                     )
                 )
             )
@@ -516,6 +528,30 @@ class SmartTaskEngine:
             now=time.monotonic(),
             usage=usage,
         )
+
+    @staticmethod
+    def _provider_id_from_route(route_id: str) -> str:
+        return route_id.split("::", 1)[0]
+
+    def _find_status(self, route_id: str) -> ProviderStatus | None:
+        return next(
+            (
+                status
+                for status in self._current_statuses()
+                if status.route_id == route_id or status.identifier == route_id
+            ),
+            None,
+        )
+
+    def _find_provider(
+        self, route_id: str, status: ProviderStatus | None
+    ) -> AgentProvider | None:
+        provider = self.providers.get(route_id)
+        if provider is None and status is not None:
+            provider = self.providers.get(status.identifier)
+        if provider is None and "::" in route_id:
+            provider = self.providers.get(self._provider_id_from_route(route_id))
+        return provider
 
     def update_router_settings(self, payload: object) -> RouterSettings:
         if not isinstance(payload, dict):
@@ -566,12 +602,36 @@ class SmartTaskEngine:
     ) -> SmartTask:
         task = self.store.get(task_id)
         plan = self.route_plan(task.instruction)
-        planned_ids = [candidate.provider_id for candidate in plan]
+        planned_ids = [candidate.route_id for candidate in plan]
         approved_ids = list(provider_ids) if provider_ids is not None else planned_ids
+        planned_by_provider: dict[str, list[str]] = {}
+        for candidate in plan:
+            planned_by_provider.setdefault(candidate.provider_id, []).append(
+                candidate.route_id
+            )
+        normalized_ids = []
+        for route_id in approved_ids:
+            if route_id in planned_ids:
+                normalized_ids.append(route_id)
+            elif route_id in planned_by_provider and len(
+                planned_by_provider[route_id]
+            ) == 1:
+                normalized_ids.append(planned_by_provider[route_id][0])
+            else:
+                raise AgentUnavailable(
+                    "No hay proveedores gratuitos disponibles o la selección no coincide con el plan."
+                )
         if (
-            not approved_ids
-            or len(set(approved_ids)) != len(approved_ids)
-            or any(provider_id not in planned_ids for provider_id in approved_ids)
+            not normalized_ids
+            or len(set(normalized_ids)) != len(normalized_ids)
+            or len(normalized_ids) > MAX_FALLBACK_ROUTES
+            or len(
+                {
+                    self._provider_id_from_route(route_id)
+                    for route_id in normalized_ids
+                }
+            )
+            > MAX_FALLBACK_PROVIDERS
         ):
             raise AgentUnavailable(
                 "No hay proveedores gratuitos disponibles o la selección no coincide con el plan."
@@ -580,7 +640,7 @@ class SmartTaskEngine:
             raise TaskValidationError(
                 "Confirma que autorizas enviar la instrucción a los proveedores seleccionados."
             )
-        return self.store.approve(task_id, approved_ids, external_consent)
+        return self.store.approve(task_id, normalized_ids, external_consent)
 
     def run_next_task(self) -> bool:
         task = self.store.claim_next()
@@ -613,89 +673,244 @@ class SmartTaskEngine:
             if not self.run_next_task():
                 self._worker_stop.wait(0.25)
 
+    def _redact_sensitive(self, value: str) -> str:
+        for secret in self.sensitive_values:
+            value = value.replace(secret, "[API KEY REDACTED]")
+        return value
+
+    def _unavailable_route_diagnostics(self, task: SmartTask) -> list[str]:
+        settings = self.store.router_settings() or RouterSettings()
+        enabled_ids = set(settings.enabled_provider_ids)
+        usage = self.store.usage()
+        estimated_prompt_tokens = math.ceil(len(task.instruction) / 3)
+        now = time.monotonic()
+        diagnostics = []
+        for status in self.provider_statuses:
+            if status.route_id in task.allowed_provider_ids or (
+                status.identifier in task.allowed_provider_ids
+            ):
+                continue
+            if not status.free_only:
+                reason = "Bloqueado por FREE_ONLY."
+            elif not status.enabled:
+                reason = status.message
+            elif status.simulation:
+                reason = "La ruta de simulación no está permitida para tareas externas."
+            elif status.identifier not in enabled_ids:
+                reason = "Deshabilitado en las preferencias del router."
+            elif self._find_provider(status.route_id, status) is None:
+                reason = "El adaptador del proveedor no está disponible."
+            elif "text" not in status.capabilities:
+                reason = "El proveedor no admite texto."
+            elif (
+                status.context_window_tokens is not None
+                and estimated_prompt_tokens + MAX_ESTIMATED_OUTPUT_TOKENS
+                > status.context_window_tokens
+            ):
+                reason = "La instrucción supera la ventana de contexto disponible."
+            else:
+                health = self.health.get(status.route_id)
+                requests, tokens, _ = usage.get(status.identifier, (0, 0, 0))
+                if health is not None and health.available_at > now:
+                    seconds = max(1, int(health.available_at - now))
+                    reason = f"En enfriamiento local; disponible en aproximadamente {seconds} s."
+                elif (
+                    requests >= LOCAL_DAILY_REQUEST_LIMIT
+                    or tokens + MAX_ESTIMATED_OUTPUT_TOKENS
+                    >= LOCAL_DAILY_TOKEN_LIMIT
+                ):
+                    reason = "Se alcanzó el límite local diario de solicitudes o tokens."
+                else:
+                    reason = "Ruta gratuita elegible, pero no autorizada para esta tarea."
+            model = status.model or "modelo no verificado"
+            diagnostics.append(
+                self._redact_sensitive(
+                    f"{status.identifier} ({model}): {reason}"
+                )
+            )
+        return diagnostics
+
     def _execute(self, task: SmartTask) -> None:
         task_started = time.monotonic()
-        latest_error = "Fallaron todos los proveedores gratuitos autorizados."
-        last_provider: str | None = None
+        route_diagnostics: list[str] = []
+        attempted_count = 0
+        final_summary = "Fallaron todos los modelos gratuitos aprobados."
         route_reasons = {
-            candidate.provider_id: candidate.explanation
+            candidate.route_id: candidate.explanation
             for candidate in self.route_plan(task.instruction)
         }
         fallback_note: str | None = None
-        for provider_id in task.allowed_provider_ids[:MAX_FALLBACK_PROVIDERS]:
+        approved_ids = list(task.allowed_provider_ids)
+        candidate_ids = approved_ids[:MAX_FALLBACK_ROUTES]
+        for index, provider_id in enumerate(candidate_ids):
             if time.monotonic() - task_started >= MAX_TASK_SECONDS:
-                latest_error = TASK_TIMEOUT_MESSAGE
+                final_summary = TASK_TIMEOUT_MESSAGE
+                route_diagnostics.extend(
+                    f"{remaining_id}: no intentado por el límite total de tiempo."
+                    for remaining_id in candidate_ids[index:]
+                )
                 break
-            provider = self.providers.get(provider_id)
-            status = next(
-                (item for item in self._current_statuses() if item.identifier == provider_id),
+            route_id = provider_id
+            status = self._find_status(route_id)
+            if status is None and "::" not in route_id:
+                status = next(
+                    (item for item in self._current_statuses() if item.identifier == route_id),
+                    None,
+                )
+            provider = self._find_provider(route_id, status)
+            base_provider_id = (
+                status.identifier
+                if status is not None
+                else self._provider_id_from_route(route_id)
+            )
+            original_status = next(
+                (item for item in self.provider_statuses if item.route_id == route_id),
+                None,
+            ) or next(
+                (item for item in self.provider_statuses if item.identifier == base_provider_id),
                 None,
             )
+            model = (
+                status.model if status is not None else None
+            ) or (
+                getattr(provider, "selected_model", None) if provider is not None else None
+            ) or (route_id.split("::", 1)[1] if "::" in route_id else "modelo no verificado")
+            if status is not None and not status.free_only:
+                route_diagnostics.append(
+                    f"{provider_id} ({model}): bloqueado por FREE_ONLY; no se envió."
+                )
+                continue
             if provider is None or status is None or not status.enabled:
-                latest_error = "Un proveedor autorizado ya no está habilitado."
+                reason = (
+                    status.message
+                    if status is not None
+                    else original_status.message
+                    if original_status is not None
+                    else "El proveedor ya no está configurado."
+                )
+                route_diagnostics.append(
+                    self._redact_sensitive(f"{provider_id} ({model}): no intentado; {reason}")
+                )
                 continue
             prompt_tokens = math.ceil(len(task.instruction) / 3)
-            output_tokens = 256 if provider_id == "cloudflare" else MAX_ESTIMATED_OUTPUT_TOKENS
+            output_tokens = status.max_output_tokens
             estimated_tokens = prompt_tokens + output_tokens
             estimated_neurons = self._cloudflare_neurons(prompt_tokens, output_tokens)
             neuron_budget = (
-                self.cloudflare_budget if provider_id == "cloudflare" else None
+                self.cloudflare_budget if base_provider_id == "cloudflare" else None
             )
             if not self.store.reserve(
-                provider_id,
+                base_provider_id,
                 estimated_tokens,
                 neuron_budget=neuron_budget,
                 estimated_neurons=estimated_neurons,
             ):
-                latest_error = "El límite local diario impide otra solicitud."
+                route_diagnostics.append(
+                    f"{provider_id} ({model}): no intentado; el límite local diario "
+                    "impide otra solicitud."
+                )
                 continue
-            last_provider = provider_id
+            attempted_count += 1
             attempt_started = time.monotonic()
             try:
-                result = provider.generate(task.instruction)
+                remaining_seconds = MAX_TASK_SECONDS - (
+                    attempt_started - task_started
+                )
+                with provider_request_timeout(remaining_seconds):
+                    result = provider.generate(task.instruction)
             except ProviderError as error:
                 latency_ms = int((time.monotonic() - attempt_started) * 1000)
-                reason = (
-                    fallback_reason(provider_id, error.kind)
-                    if error.retryable
-                    else f"{provider_id}: {str(error)}"
-                )
+                safe_message = self._redact_sensitive(str(error))
+                detail = f"{base_provider_id} ({model}): {error.kind}"
+                if error.http_status is not None:
+                    detail += f" (HTTP {error.http_status})"
+                detail += f" — {safe_message}"
+                if error.retryable:
+                    reason = (
+                        f"{detail}; {fallback_reason(base_provider_id, error.kind)}"
+                    )
+                    route_diagnostics.append(
+                        f"{detail}; se intentará la siguiente ruta aprobada."
+                    )
+                else:
+                    reason = detail
+                    route_diagnostics.append(detail)
                 self.store.record_attempt(
                     task.id,
-                    provider_id,
-                    status.model or "",
+                    base_provider_id,
+                    model,
                     "failed",
                     reason,
                     latency_ms,
                 )
-                self._record_failure(provider_id, error)
-                latest_error = str(error)
+                self._record_failure(route_id, error)
                 if error.kind == "credentials":
                     self._disable_provider(
-                        provider_id,
+                        base_provider_id,
                         "Credenciales inválidas; corrige la configuración del servidor.",
+                    )
+                    final_summary = (
+                        "Se detuvo el fallback por credenciales inválidas; "
+                        "no se enviará la tarea a otro proveedor."
+                    )
+                    route_diagnostics.extend(
+                        f"{remaining_id}: no intentado por la política de credenciales."
+                        for remaining_id in candidate_ids[index + 1 :]
                     )
                     break
                 if error.retryable:
-                    fallback_note = fallback_reason(provider_id, error.kind)
+                    if error.kind == "access_blocked":
+                        self._disable_provider(
+                            base_provider_id,
+                            "Ruta suspendida por bloqueo de acceso; no se intentará eludirlo.",
+                        )
+                    fallback_note = fallback_reason(base_provider_id, error.kind)
                     continue
+                final_summary = (
+                    "Se detuvo el fallback porque el error no admite reintentos "
+                    "con otro proveedor."
+                )
+                route_diagnostics.extend(
+                    f"{remaining_id}: no intentado por la política de no reintentar "
+                    f"errores {error.kind}."
+                    for remaining_id in candidate_ids[index + 1 :]
+                )
                 break
             latency_ms = int((time.monotonic() - attempt_started) * 1000)
-            for secret in self.sensitive_values:
-                result = result.replace(secret, "[API KEY REDACTED]")
-            self._record_success(provider_id, latency_ms)
+            if not isinstance(result, str) or not result.strip():
+                error = ProviderError(
+                    "El proveedor no devolvió una respuesta de texto válida.",
+                    kind="invalid_response",
+                )
+                self.store.record_attempt(
+                    task.id,
+                    base_provider_id,
+                    model,
+                    "failed",
+                    self._redact_sensitive(str(error)),
+                    latency_ms,
+                )
+                self._record_failure(route_id, error)
+                route_diagnostics.append(
+                    f"{base_provider_id} ({model}): invalid_response — "
+                    f"{self._redact_sensitive(str(error))}; se intentará la siguiente ruta aprobada."
+                )
+                fallback_note = fallback_reason(base_provider_id, error.kind)
+                continue
+            result = self._redact_sensitive(result)
+            self._record_success(route_id, latency_ms)
             self.store.record_attempt(
                 task.id,
-                provider_id,
+                base_provider_id,
                 getattr(provider, "selected_model", status.model) or "",
                 "completed",
                 (
-                    f"{fallback_note}; siguiente proveedor autorizado. "
+                    f"{fallback_note}; siguiente ruta aprobada. "
                     if fallback_note
                     else ""
                 )
                 + route_reasons.get(
-                    provider_id,
+                    route_id,
                     "Proveedor autorizado al aprobar la tarea; no hay métricas de calidad medidas.",
                 ),
                 latency_ms,
@@ -703,13 +918,31 @@ class SmartTaskEngine:
             self.store.complete(
                 task.id,
                 result=result,
-                provider_id=provider_id,
+                provider_id=base_provider_id,
                 model=getattr(provider, "selected_model", status.model),
             )
             return
-        final_error = latest_error
-        if last_provider is None and latest_error == "Fallaron todos los proveedores gratuitos autorizados.":
-            final_error = "No quedan solicitudes gratuitas disponibles para esta tarea."
+        if attempted_count == 0 and final_summary == "Fallaron todos los modelos gratuitos aprobados.":
+            final_summary = "Ninguna ruta gratuita aprobada pudo iniciar una solicitud."
+        route_diagnostics.extend(
+            f"{provider_id}: no intentado porque se excede el máximo de "
+            f"{MAX_FALLBACK_ROUTES} rutas por tarea."
+            for provider_id in approved_ids[MAX_FALLBACK_ROUTES:]
+        )
+        unavailable_routes = self._unavailable_route_diagnostics(task)
+        diagnostic_sections = [final_summary]
+        if route_diagnostics:
+            diagnostic_sections.extend(
+                ["Diagnóstico de rutas aprobadas:", *[f"- {line}" for line in route_diagnostics]]
+            )
+        if unavailable_routes:
+            diagnostic_sections.extend(
+                [
+                    "Otras rutas gratuitas no disponibles o no autorizadas:",
+                    *[f"- {line}" for line in unavailable_routes],
+                ]
+            )
+        final_error = self._redact_sensitive("\n".join(diagnostic_sections))
         self.store.complete(task.id, error=final_error)
 
     @staticmethod
@@ -725,7 +958,7 @@ class SmartTaskEngine:
     def _record_failure(self, provider_id: str, error: ProviderError) -> None:
         state = self.health.setdefault(provider_id, ProviderHealth())
         state.failures += 1
-        state.last_error = str(error)
+        state.last_error = self._redact_sensitive(str(error))
         state.last_failure_kind = error.kind
         if error.retryable:
             state.available_at = time.monotonic() + PROVIDER_COOLDOWN_SECONDS
@@ -753,10 +986,15 @@ class SmartTaskEngine:
                 free_only=status.free_only,
                 capabilities=status.capabilities,
                 context_window_tokens=status.context_window_tokens,
+                max_output_tokens=status.max_output_tokens,
+                local_daily_request_limit=status.local_daily_request_limit,
+                local_daily_token_limit=status.local_daily_token_limit,
             )
             for status in self.provider_statuses
         )
-        self.providers.pop(provider_id, None)
+        for route_id in tuple(self.providers):
+            if route_id == provider_id or route_id.startswith(f"{provider_id}::"):
+                self.providers.pop(route_id, None)
 
     def _current_statuses(self) -> tuple[ProviderStatus, ...]:
         settings = self.store.router_settings() or RouterSettings()
@@ -766,7 +1004,9 @@ class SmartTaskEngine:
                 identifier=status.identifier,
                 display_name=status.display_name,
                 configured=status.configured,
-                enabled=status.enabled and status.identifier in active,
+                enabled=status.enabled
+                and status.free_only
+                and status.identifier in active,
                 simulation=status.simulation,
                 message=status.message,
                 model=status.model,
@@ -775,6 +1015,9 @@ class SmartTaskEngine:
                 free_only=status.free_only,
                 capabilities=status.capabilities,
                 context_window_tokens=status.context_window_tokens,
+                max_output_tokens=status.max_output_tokens,
+                local_daily_request_limit=status.local_daily_request_limit,
+                local_daily_token_limit=status.local_daily_token_limit,
             )
             for status in self.provider_statuses
         )
@@ -784,26 +1027,84 @@ class SmartTaskEngine:
 
     def public_status(self) -> dict[str, object]:
         usage = self.store.usage()
-        statuses = []
         settings = self.store.router_settings() or RouterSettings()
         active_ids = set(settings.enabled_provider_ids)
+        health_by_route = {
+            entry["route_id"]: entry for entry in public_health(self.health)
+        }
+        groups: dict[str, list[ProviderStatus]] = {}
         for status in self.provider_statuses:
-            requests, tokens, neurons = usage.get(status.identifier, (0, 0, 0))
+            groups.setdefault(status.identifier, []).append(status)
+        statuses = []
+        for provider_id, provider_models in groups.items():
+            requests, tokens, neurons = usage.get(provider_id, (0, 0, 0))
+            models = []
+            for status in provider_models:
+                health = health_by_route.get(status.route_id)
+                models.append(
+                    {
+                        "route_id": status.route_id,
+                        "model": status.model if status.free_only else None,
+                        "configured": status.configured,
+                        "eligible": status.enabled and status.free_only,
+                        "enabled": status.enabled
+                        and status.free_only
+                        and provider_id in active_ids,
+                        "message": status.message
+                        if status.free_only
+                        else "Deshabilitado por FREE_ONLY; modelo no verificado.",
+                        "availability": (
+                            health["state"] if health else status.availability
+                        ),
+                        "capabilities": list(status.capabilities),
+                        "context_window_tokens": status.context_window_tokens,
+                        "max_output_tokens": status.max_output_tokens,
+                        "local_daily_request_limit": status.local_daily_request_limit,
+                        "local_daily_token_limit": status.local_daily_token_limit,
+                        "health": health,
+                    }
+                )
+            eligible_models = [
+                model for model in models if model["eligible"] and model["model"]
+            ]
+            capabilities = sorted(
+                {
+                    capability
+                    for model in eligible_models
+                    for capability in model["capabilities"]
+                }
+            )
             statuses.append(
                 {
-                    "id": status.identifier,
-                    "name": status.display_name,
-                    "model": status.model,
-                    "configured": status.configured,
-                    "eligible": status.enabled,
-                    "enabled": status.enabled and status.identifier in active_ids,
-                    "simulation": status.simulation,
-                    "message": status.message,
-                    "availability": status.availability,
-                    "quota": status.quota,
-                    "free_only": status.free_only,
-                    "capabilities": list(status.capabilities),
-                    "context_window_tokens": status.context_window_tokens,
+                    "id": provider_id,
+                    "name": provider_models[0].display_name,
+                    "model": (
+                        eligible_models[0]["model"]
+                        if len(eligible_models) == 1
+                        else None
+                    ),
+                    "models": models,
+                    "configured": any(status.configured for status in provider_models),
+                    "eligible": bool(eligible_models),
+                    "enabled": bool(eligible_models) and provider_id in active_ids,
+                    "simulation": all(status.simulation for status in provider_models),
+                    "message": (
+                        next(
+                            (status.message for status in provider_models if status.enabled),
+                            provider_models[0].message,
+                        )
+                    ),
+                    "availability": (
+                        "available" if eligible_models else "disabled"
+                    ),
+                    "quota": provider_models[0].quota,
+                    "free_only": all(status.free_only for status in provider_models),
+                    "capabilities": capabilities,
+                    "context_window_tokens": (
+                        eligible_models[0]["context_window_tokens"]
+                        if len(eligible_models) == 1
+                        else None
+                    ),
                     "local_requests_today": requests,
                     "local_estimated_tokens_today": tokens,
                     "local_estimated_neurons_today": neurons,

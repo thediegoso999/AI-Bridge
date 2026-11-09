@@ -3,8 +3,10 @@
 import json
 import os
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Mapping, Protocol
+from typing import Iterator, Mapping, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -13,6 +15,18 @@ PROVIDER_TIMEOUT_SECONDS = 15
 FREE_ONLY = True
 MAX_PROVIDER_OUTPUT_TOKENS = 512
 MAX_CLOUDFLARE_LOCAL_NEURON_BUDGET = 8_000
+_REQUEST_TIMEOUT_SECONDS: ContextVar[float | None] = ContextVar(
+    "aibridge_provider_request_timeout_seconds", default=None
+)
+
+
+@contextmanager
+def provider_request_timeout(timeout_seconds: float) -> Iterator[None]:
+    token = _REQUEST_TIMEOUT_SECONDS.set(timeout_seconds)
+    try:
+        yield
+    finally:
+        _REQUEST_TIMEOUT_SECONDS.reset(token)
 
 
 class ProviderError(RuntimeError):
@@ -27,7 +41,13 @@ class ProviderError(RuntimeError):
 
     @property
     def retryable(self) -> bool:
-        return self.kind in {"rate_limited", "transient", "model_unavailable"}
+        return self.kind in {
+            "access_blocked",
+            "invalid_response",
+            "rate_limited",
+            "transient",
+            "model_unavailable",
+        }
 
 
 class AgentProvider(Protocol):
@@ -53,6 +73,26 @@ class ProviderStatus:
     free_only: bool = True
     capabilities: tuple[str, ...] = ("text",)
     context_window_tokens: int | None = None
+    max_output_tokens: int = MAX_PROVIDER_OUTPUT_TOKENS
+    local_daily_request_limit: int = 20
+    local_daily_token_limit: int = 20_000
+
+    @property
+    def route_id(self) -> str:
+        return model_route_id(self.identifier, self.model) if self.model else self.identifier
+
+
+@dataclass(frozen=True)
+class FreeModel:
+    provider_id: str
+    model: str
+    capabilities: tuple[str, ...]
+    context_window_tokens: int | None
+    max_output_tokens: int
+
+
+def model_route_id(provider_id: str, model: str) -> str:
+    return f"{provider_id}::{model}"
 
 
 @dataclass(frozen=True)
@@ -78,7 +118,13 @@ def _post_json(url: str, headers: dict[str, str], payload: dict[str, object]) ->
         method="POST",
     )
     try:
-        with urlopen(request, timeout=PROVIDER_TIMEOUT_SECONDS) as response:
+        request_timeout = _REQUEST_TIMEOUT_SECONDS.get()
+        timeout = (
+            min(PROVIDER_TIMEOUT_SECONDS, max(0.001, request_timeout))
+            if request_timeout is not None
+            else PROVIDER_TIMEOUT_SECONDS
+        )
+        with urlopen(request, timeout=timeout) as response:
             body = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
     except HTTPError as error:
         try:
@@ -100,12 +146,21 @@ def _post_json(url: str, headers: dict[str, str], payload: dict[str, object]) ->
                 "unknown model",
             )
         )
-        if error.code == 429:
+        cloudflare_access_block = (
+            error.code == 403
+            and "1010" in error_body
+            and "cloudflare" in error_body
+        )
+        if cloudflare_access_block:
+            kind = "access_blocked"
+        elif error.code == 429:
             kind = "rate_limited"
         elif error.code in {408, 500, 502, 503, 504}:
             kind = "transient"
-        elif error.code in {401, 403} or invalid_key:
+        elif error.code == 401 or invalid_key:
             kind = "credentials"
+        elif error.code == 403:
+            kind = "access_blocked"
         elif error.code == 404:
             kind = "model_unavailable"
         elif unavailable_model:
@@ -114,8 +169,13 @@ def _post_json(url: str, headers: dict[str, str], payload: dict[str, object]) ->
             kind = "invalid_request"
         else:
             kind = "permanent"
+        message = (
+            "Bloqueo de acceso Cloudflare 1010 (HTTP 403); no se intentará eludir la protección."
+            if cloudflare_access_block
+            else f"El proveedor rechazó la solicitud (HTTP {error.code})."
+        )
         raise ProviderError(
-            f"El proveedor rechazó la solicitud (HTTP {error.code}).",
+            message,
             kind=kind,
             http_status=error.code,
         ) from error
@@ -354,9 +414,6 @@ class OpenAICompatibleProvider:
                 f"{self.display_name} devolvió una respuesta no válida.",
                 kind="invalid_response",
             )
-        actual_model = response.get("model")
-        if isinstance(actual_model, str) and actual_model:
-            self.selected_model = actual_model
         choices = response.get("choices")
         choice = choices[0] if isinstance(choices, list) and choices else None
         if not isinstance(choice, dict):
@@ -468,9 +525,44 @@ _PROVIDER_DEFINITIONS = (
 _FREE_MODEL_ALLOWLISTS = {
     "gemini": {"gemini-3.8-flash"},
     "groq": {"openai/gpt-oss-20b", "openai/gpt-oss-120b"},
+    "openrouter": {"openrouter/free"},
     "cloudflare": {"@cf/meta/llama-3.2-1b-instruct"},
 }
 _FREE_ROUTER_MODEL = "openrouter/free"
+FREE_MODEL_REGISTRY = {
+    model.provider_id + "::" + model.model: model
+    for model in (
+        FreeModel(
+            "gemini",
+            "gemini-3.8-flash",
+            ("text", "programming", "reasoning"),
+            1_048_576,
+            MAX_PROVIDER_OUTPUT_TOKENS,
+        ),
+        FreeModel(
+            "groq",
+            "openai/gpt-oss-20b",
+            ("text", "programming", "reasoning"),
+            131_072,
+            MAX_PROVIDER_OUTPUT_TOKENS,
+        ),
+        FreeModel(
+            "groq",
+            "openai/gpt-oss-120b",
+            ("text", "programming", "reasoning"),
+            131_072,
+            MAX_PROVIDER_OUTPUT_TOKENS,
+        ),
+        FreeModel("openrouter", "openrouter/free", ("text",), None, MAX_PROVIDER_OUTPUT_TOKENS),
+        FreeModel(
+            "cloudflare",
+            "@cf/meta/llama-3.2-1b-instruct",
+            ("text",),
+            None,
+            256,
+        ),
+    )
+}
 _LOCAL_DAILY_REQUEST_LIMIT = 20
 _LOCAL_DAILY_TOKEN_LIMIT = 20_000
 
@@ -482,7 +574,7 @@ def _strict_true(env: Mapping[str, str], name: str) -> bool:
 def configure_free_providers(
     environment: Mapping[str, str] | None = None,
 ) -> FreeProviderConfiguration:
-    """Configure only providers whose selected route has a documented free path."""
+    """Configure only explicitly confirmed, registered free model routes."""
     env = os.environ if environment is None else environment
     providers: dict[str, AgentProvider] = {}
     statuses: list[ProviderStatus] = []
@@ -492,6 +584,7 @@ def configure_free_providers(
             GeminiProvider.display_name,
             "GEMINI_API_KEY",
             "AI_BRIDGE_GEMINI_MODEL",
+            "AI_BRIDGE_GEMINI_MODELS",
             "gemini-3.8-flash",
             GeminiProvider,
             "AI_BRIDGE_GEMINI_FREE_TIER_CONFIRMED",
@@ -502,7 +595,8 @@ def configure_free_providers(
             "GroqCloud",
             "GROQ_API_KEY",
             "AI_BRIDGE_GROQ_MODEL",
-            "openai/gpt-oss-20b",
+            "AI_BRIDGE_GROQ_MODELS",
+            "openai/gpt-oss-20b,openai/gpt-oss-120b",
             GroqProvider,
             "AI_BRIDGE_GROQ_FREE_TIER_CONFIRMED",
             "Confirma en el entorno del servidor que la cuenta mantiene el plan gratuito.",
@@ -512,6 +606,7 @@ def configure_free_providers(
             "OpenRouter",
             "OPENROUTER_API_KEY",
             "AI_BRIDGE_OPENROUTER_MODEL",
+            "AI_BRIDGE_OPENROUTER_MODELS",
             _FREE_ROUTER_MODEL,
             OpenRouterProvider,
             "",
@@ -522,6 +617,7 @@ def configure_free_providers(
             CloudflareWorkersAIProvider.display_name,
             "CLOUDFLARE_API_TOKEN",
             "AI_BRIDGE_CLOUDFLARE_MODEL",
+            "AI_BRIDGE_CLOUDFLARE_MODELS",
             "@cf/meta/llama-3.2-1b-instruct",
             None,
             "AI_BRIDGE_CLOUDFLARE_FREE_PLAN_CONFIRMED",
@@ -533,25 +629,25 @@ def configure_free_providers(
         display_name,
         key_name,
         model_name,
+        models_name,
         default_model,
         provider_type,
         confirmation_name,
         confirmation_message,
     ) in definitions:
         key = env.get(key_name, "").strip()
-        model = env.get(model_name, default_model).strip()
+        configured_models = env.get(models_name, "").strip()
+        model_value = configured_models or env.get(model_name, default_model)
+        models = tuple(
+            dict.fromkeys(
+                item.strip() for item in model_value.split(",") if item.strip()
+            )
+        )
         account_id = env.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
         configured = bool(key)
         if identifier == "cloudflare":
             configured = bool(key and account_id)
         allowlist = _FREE_MODEL_ALLOWLISTS.get(identifier)
-        model_allowed = (
-            model in allowlist
-            if allowlist is not None
-            else model == _FREE_ROUTER_MODEL or model.endswith(":free")
-        )
-        if identifier == "openrouter" and model == _FREE_ROUTER_MODEL:
-            model_allowed = True
         confirmation_ok = (
             not confirmation_name or _strict_true(env, confirmation_name)
         )
@@ -563,14 +659,12 @@ def configure_free_providers(
                 budget = 0
             budget_ok = 1 <= budget <= MAX_CLOUDFLARE_LOCAL_NEURON_BUDGET
 
-        enabled = configured and model_allowed and confirmation_ok and budget_ok
+        provider_enabled = configured and confirmation_ok and budget_ok
         if not configured:
             message = (
                 f"Falta {key_name}"
                 + (" o CLOUDFLARE_ACCOUNT_ID." if identifier == "cloudflare" else ".")
             )
-        elif not model_allowed:
-            message = "Deshabilitado: el modelo no está en la lista de modelos gratuitos verificados."
         elif not confirmation_ok:
             message = f"Deshabilitado: {confirmation_message}"
         elif not budget_ok:
@@ -589,49 +683,66 @@ def configure_free_providers(
         if identifier == "cloudflare":
             quota_message = (
                 "Plan Workers Free confirmado por el operador; presupuesto local "
-                f"configurado: {budget if enabled else 0} neuronas/día (máximo "
+                f"configurado: {budget if provider_enabled else 0} neuronas/día (máximo "
                 f"{MAX_CLOUDFLARE_LOCAL_NEURON_BUDGET}). La cuota compartida no se consulta."
             )
-        if identifier == "cloudflare" and enabled:
-            provider = CloudflareWorkersAIProvider(key, account_id, model)
-        elif provider_type is not None and enabled:
-            provider = provider_type(key, model)
-        else:
-            provider = None
-        if provider is not None:
-            providers[identifier] = provider
-        statuses.append(
-            ProviderStatus(
-                identifier=identifier,
-                display_name=display_name,
-                configured=configured,
-                enabled=enabled,
-                simulation=False,
-                message=message,
-                model=model if model_allowed else None,
-                availability="not_checked" if enabled else "disabled",
-                quota=quota_message
-                if enabled
-                else "Cuota gratuita no verificada; no se harán solicitudes.",
-                free_only=FREE_ONLY,
-                capabilities=(
-                    ("text", "programming", "reasoning")
-                    if identifier == "gemini" and model == "gemini-3.8-flash"
-                    else ("text", "programming", "reasoning")
-                    if identifier == "groq"
-                    and model in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}
-                    else ("text",)
-                ),
-                context_window_tokens=(
-                    1_048_576
-                    if identifier == "gemini" and model == "gemini-3.8-flash"
-                    else 131_072
-                    if identifier == "groq"
-                    and model in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}
-                    else None
-                ),
+        for model in models:
+            model_spec = FREE_MODEL_REGISTRY.get(model_route_id(identifier, model))
+            model_allowed = model_spec is not None and (
+                allowlist is None or model in allowlist
             )
-        )
+            enabled = provider_enabled and model_allowed
+            if not model_allowed:
+                model_message = (
+                    "Deshabilitado: el modelo no está en el registro gratuito verificado."
+                )
+            else:
+                model_message = message
+            if enabled:
+                if identifier == "cloudflare":
+                    provider: AgentProvider = CloudflareWorkersAIProvider(key, account_id, model)
+                elif provider_type is not None:
+                    provider = provider_type(key, model)
+                else:
+                    continue
+                providers[model_route_id(identifier, model)] = provider
+            statuses.append(
+                ProviderStatus(
+                    identifier=identifier,
+                    display_name=display_name,
+                    configured=configured,
+                    enabled=enabled,
+                    simulation=False,
+                    message=model_message,
+                    model=model if model_allowed else None,
+                    availability="not_checked" if enabled else "disabled",
+                    quota=quota_message
+                    if enabled
+                    else "Cuota gratuita no verificada; no se harán solicitudes.",
+                    free_only=FREE_ONLY if model_allowed else False,
+                    capabilities=model_spec.capabilities if model_spec else ("text",),
+                    context_window_tokens=(
+                        model_spec.context_window_tokens if model_spec else None
+                    ),
+                    max_output_tokens=(
+                        model_spec.max_output_tokens
+                        if model_spec
+                        else MAX_PROVIDER_OUTPUT_TOKENS
+                    ),
+                )
+            )
+        if not models:
+            statuses.append(
+                ProviderStatus(
+                    identifier=identifier,
+                    display_name=display_name,
+                    configured=configured,
+                    enabled=False,
+                    simulation=False,
+                    message="No hay modelos configurados.",
+                    free_only=False,
+                )
+            )
     return FreeProviderConfiguration(
         providers=providers,
         statuses=tuple(statuses),
