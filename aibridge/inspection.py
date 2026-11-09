@@ -28,7 +28,7 @@ def inspect_repository(root: str | Path = ".") -> RepositorySnapshot:
     if workflows_path.is_dir():
         workflow_files = tuple(
             sorted(
-                str(path.relative_to(root_path))
+                path.relative_to(root_path).as_posix()
                 for path in workflows_path.iterdir()
                 if path.is_file() and path.suffix.lower() in {".yml", ".yaml"}
             )
@@ -39,7 +39,7 @@ def inspect_repository(root: str | Path = ".") -> RepositorySnapshot:
     if tests_path.is_dir():
         test_files = tuple(
             sorted(
-                str(path.relative_to(root_path))
+                path.relative_to(root_path).as_posix()
                 for path in tests_path.rglob("test*.py")
                 if path.is_file()
             )

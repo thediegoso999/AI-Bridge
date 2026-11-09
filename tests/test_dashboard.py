@@ -28,7 +28,7 @@ class DashboardHTTPTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name)
-        (self.root / "README.md").write_text("Local project\n", encoding="utf-8")
+        (self.root / "README.md").write_text("Local project\n", encoding="utf-8", newline="\n")
         (self.root / "main.py").write_text("print('hello')\n", encoding="utf-8")
         (self.root / ".env").write_text("SECRET=value\n", encoding="utf-8")
         (self.root / ".git").mkdir()
