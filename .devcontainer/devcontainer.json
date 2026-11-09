@@ -1,6 +1,14 @@
 {
   "name": "AI-Bridge Python 3.11",
   "image": "mcr.microsoft.com/devcontainers/python:1-3.11-bookworm",
+  "forwardPorts": [8000],
+  "portsAttributes": {
+    "8000": {
+      "label": "AI-Bridge Control Center",
+      "onAutoForward": "openBrowser",
+      "visibility": "private"
+    }
+  },
   "customizations": {
     "vscode": {
       "extensions": [
