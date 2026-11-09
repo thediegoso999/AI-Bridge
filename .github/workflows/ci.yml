@@ -10,7 +10,11 @@ permissions:
 
 jobs:
   verificar:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 5
 
     steps:
@@ -22,10 +26,18 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Preparar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Comprobar sintaxis
-        run: python -m compileall -q aibridge tests
+        run: |
+          python -m compileall -q aibridge tests
+          node --check aibridge/web/app.js
 
       - name: Ejecutar pruebas
+        shell: bash
         run: |
           python - <<'PY'
           import sys

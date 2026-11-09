@@ -31,7 +31,11 @@ def main() -> None:
             server = create_server(arguments.root, host=host, port=arguments.port)
         except ValueError as error:
             parser.error(str(error))
-        print(f"AI-Bridge Control Center escuchando en el puerto {arguments.port}.")
+        print(
+            "Código de acceso al dashboard (solo esta sesión): "
+            f"{server.authorization_token}"
+        )
+        print(f"AI-Bridge Control Center escuchando en el puerto {server.server_port}.")
         try:
             server.serve_forever()
         except KeyboardInterrupt:

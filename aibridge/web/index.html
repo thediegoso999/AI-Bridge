@@ -34,7 +34,7 @@
 
         <div class="sidebar-bottom">
           <div class="sidebar-service"><span class="status-dot" id="sidebar-api-dot"></span><span id="sidebar-api-label">Conectando al servidor</span></div>
-          <div class="sidebar-footnote">V2 · READ-ONLY MODE</div>
+          <div class="sidebar-footnote">V3 · APPROVAL-GATED TASKS</div>
         </div>
       </aside>
 
@@ -50,7 +50,7 @@
         <div class="content-area">
           <section class="view" id="view-dashboard" aria-labelledby="page-title">
             <div class="page-heading">
-              <div><p class="eyebrow">DEVELOPMENT OPERATIONS <span class="eyebrow-rule"></span> V2</p><h1 id="page-title">Control Center</h1></div>
+              <div><p class="eyebrow">DEVELOPMENT OPERATIONS <span class="eyebrow-rule"></span> V3</p><h1 id="page-title">Control Center</h1></div>
               <div class="project-identity"><span class="identity-caption">LOCAL PROJECT</span><strong id="project-name">Loading...</strong></div>
             </div>
 
@@ -112,12 +112,51 @@
           </section>
 
           <section class="view" id="view-agents" aria-labelledby="agents-title" hidden>
-            <div class="page-heading"><div><p class="eyebrow">FUTURE INTEGRATIONS</p><h1 id="agents-title">Agent workspace</h1></div><span class="status-badge is-offline" id="agent-badge">NOT CONFIGURED</span></div>
-            <section class="agent-empty-state">
+            <div class="page-heading"><div><p class="eyebrow">APPROVAL-GATED TASKS</p><h1 id="agents-title">Agent workspace</h1></div><span class="status-badge is-offline" id="agent-badge">NOT CONFIGURED</span></div>
+            <section class="agent-provider-panel" aria-live="polite">
               <div class="agent-mark" aria-hidden="true">A.</div>
-              <div><p class="eyebrow">NO PROVIDER CONNECTED</p><h2>Agent runtime is not configured</h2><p id="agent-message">No calls will be made to AI services. Copilot Free is available in the editor and is not an inference API for this application.</p></div>
+              <div><p class="eyebrow">SMART AI ROUTER · FREE_ONLY</p><h2 id="agent-provider-name">No free provider available</h2><p id="agent-message">External calls remain disabled until a free provider is configured and explicitly approved per task.</p></div>
             </section>
-            <p class="agent-footnote">Future model support will use an official provider API with explicit configuration. No credentials are stored in this interface.</p>
+            <section class="content-section agent-login-section" id="agent-login-section">
+              <div class="section-heading"><div><p class="eyebrow">LOCAL SERVER AUTHORIZATION</p><h2>Unlock task workspace</h2></div></div>
+              <form id="agent-login-form" class="task-form">
+                <label for="agent-access-code">Access code shown in the server terminal</label>
+                <input id="agent-access-code" name="access_code" type="password" autocomplete="current-password" required>
+                <button class="button button-dark" id="agent-login-button" type="submit">Unlock task workspace</button>
+                <p class="task-feedback" id="agent-login-feedback" role="status" aria-live="polite"></p>
+              </form>
+            </section>
+            <div class="agent-columns" id="agent-columns" hidden>
+              <section class="content-section router-section">
+                <div class="section-heading"><div><p class="eyebrow">SMART AI ROUTER</p><h2>Routing preferences</h2></div><span class="run-total" id="router-mode-state">FREE_ONLY</span></div>
+                <div class="router-controls">
+                  <label for="router-mode">ROUTING MODE<select id="router-mode"><option value="automatic">Automatic</option><option value="manual">Manual with fallback</option></select></label>
+                  <label for="router-manual-provider">PREFERRED PROVIDER<select id="router-manual-provider"></select></label>
+                  <div class="router-provider-list" id="router-provider-list" aria-live="polite"></div>
+                  <button class="button button-dark" id="router-save" type="button">Save routing preferences</button>
+                  <p class="task-feedback" id="router-feedback" role="status" aria-live="polite"></p>
+                </div>
+                <div class="router-history">
+                  <div class="section-heading"><div><p class="eyebrow">RECENT ROUTING</p><h3>Provider attempts & fallbacks</h3></div></div>
+                  <div id="router-attempts" aria-live="polite"></div>
+                </div>
+              </section>
+              <section class="content-section agent-form-section">
+                <div class="section-heading"><div><p class="eyebrow">NEW TASK</p><h2>Instruction</h2></div></div>
+                <form id="task-form" class="task-form">
+                  <label for="task-instruction">Describe what you want the provider to do</label>
+                  <textarea id="task-instruction" name="instruction" rows="7" maxlength="8000" required placeholder="Write an instruction for the selected AI provider."></textarea>
+                  <p class="agent-footnote">Submitting only saves a local pending task. Nothing is sent until you approve it. Generated text is never run as code or applied to files.</p>
+                  <button class="button button-dark" id="task-submit" type="submit">Save pending task</button>
+                  <p class="task-feedback" id="task-feedback" role="status" aria-live="polite"></p>
+                </form>
+              </section>
+              <section class="content-section agent-history-section">
+                <div class="section-heading"><div><p class="eyebrow">LOCAL SQLITE HISTORY</p><h2>Tasks</h2></div><span class="run-total" id="task-total">0</span></div>
+                <div id="agent-tasks" aria-live="polite"></div>
+              </section>
+            </div>
+            <p class="agent-footnote">FREE_ONLY is always enabled: paid models and paid-provider fallbacks are rejected. Local request/token caps are conservative safeguards, not the providers' official quotas. Before each approval, the dashboard shows which free providers may receive the instruction. No files or commands are sent or executed automatically.</p>
           </section>
         </div>
       </main>

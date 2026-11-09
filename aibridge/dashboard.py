@@ -1,15 +1,32 @@
-"""Private, read-only HTTP control center for Codespaces and local use."""
+"""Private HTTP control center with a read-only workspace and approved agent tasks."""
 
 import json
+import hmac
+import os
+import re
+import secrets
+import sqlite3
+import time
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.cookies import CookieError, SimpleCookie
 from pathlib import Path, PurePosixPath
 from urllib.parse import parse_qs, urlsplit
 
+from aibridge.agents import (
+    AgentEngine,
+    AgentUnavailable,
+    TaskConflict,
+    TaskNotFound,
+    TaskValidationError,
+)
 from aibridge.github import GitHubClient, GitHubUnavailable
 from aibridge.inspection import inspect_repository
+from aibridge.router import classify_task
+from aibridge.smart_router import SmartTaskEngine, create_smart_engine
 
 MAX_PREVIEW_BYTES = 160_000
+MAX_AGENT_REQUEST_BYTES = 64_000
 EXCLUDED_DIRECTORIES = {
     ".git",
     ".venv",
@@ -25,13 +42,19 @@ EXCLUDED_SUFFIXES = {".pem", ".key", ".p12", ".pfx", ".p8"}
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
-    """Serve the dashboard and read-only JSON endpoints."""
+    """Serve the dashboard and authenticated, approval-gated agent endpoints."""
 
     repository_root = Path.cwd()
     github_client = GitHubClient()
+    agent_engine: AgentEngine | None = None
+    authorization_token = ""
+    allowed_origins: frozenset[str] = frozenset()
     web_root = Path(__file__).with_name("web")
 
     def do_GET(self) -> None:
+        if not self._valid_host():
+            self._send_json(403, {"error": "Host no autorizado."})
+            return
         request = urlsplit(self.path)
         if request.path == "/":
             self._send_static("index.html", "text/html; charset=utf-8")
@@ -45,6 +68,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not request.path.startswith("/api/"):
             self._send_json(404, {"error": "Ruta no encontrada."})
             return
+        if request.path == "/api/agents" and not self._is_authenticated():
+            self._send_json(401, {"error": "Inicia sesión para consultar el historial de tareas."})
+            return
 
         query = parse_qs(request.query, keep_blank_values=True)
         try:
@@ -57,22 +83,237 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "La ruta solicitada no existe."})
         except PermissionError:
             self._send_json(403, {"error": "No se permite acceder a esa ruta."})
+        except sqlite3.Error:
+            self._send_json(500, {"error": "No se pudo acceder al historial local de tareas."})
         except OSError:
             self._send_json(500, {"error": "No se pudo leer el recurso local."})
         else:
             self._send_json(200, payload)
 
+    def do_POST(self) -> None:
+        if not self._valid_same_origin_request():
+            self._send_json(403, {"error": "Solicitud no autorizada o token CSRF no válido."})
+            return
+        if self.path not in {
+            "/api/agents/auth",
+            "/api/agents/tasks",
+            "/api/agents/router",
+            "/api/agents/plan",
+        } and not re.fullmatch(
+            r"/api/agents/tasks/[0-9a-f]{32}/approve", self.path
+        ):
+            self._send_json(404, {"error": "Ruta no encontrada."})
+            return
+
+        if self.path != "/api/agents/auth" and not self._is_authenticated():
+            self._send_json(401, {"error": "Inicia sesión para administrar tareas."})
+            return
+
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json(400, {"error": "Longitud de solicitud no válida."})
+            return
+        if content_length < 0 or content_length > MAX_AGENT_REQUEST_BYTES:
+            self._send_json(413, {"error": "La solicitud supera el tamaño permitido."})
+            return
+
+        try:
+            if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+                raise ValueError("El contenido debe enviarse como JSON.")
+            payload = json.loads(self.rfile.read(content_length))
+            if not isinstance(payload, dict):
+                raise ValueError("El cuerpo JSON debe ser un objeto.")
+
+            if self.path == "/api/agents/auth":
+                access_code = payload.get("access_code")
+                if not isinstance(access_code, str) or not secrets.compare_digest(
+                    access_code, self.authorization_token
+                ):
+                    self._send_json(401, {"error": "Código de acceso no válido."})
+                    return
+                self._auth_cookie = self._create_session_token()
+                self._send_json(200, {"authenticated": True})
+                return
+
+            if self.path == "/api/agents/tasks":
+                task = self._get_agent_engine().create_task(payload.get("instruction"))
+                self._send_json(201, {"task": asdict(task)})
+                return
+
+            if self.path == "/api/agents/router":
+                engine = self._get_agent_engine()
+                if not isinstance(engine, SmartTaskEngine):
+                    raise ValueError("El router inteligente no está disponible.")
+                settings = engine.update_router_settings(payload)
+                self._send_json(200, {"settings": settings.as_dict()})
+                return
+
+            if self.path == "/api/agents/plan":
+                engine = self._get_agent_engine()
+                if not isinstance(engine, SmartTaskEngine):
+                    raise ValueError("El router inteligente no está disponible.")
+                instruction = payload.get("instruction")
+                if not isinstance(instruction, str) or not instruction.strip():
+                    raise TaskValidationError("Escribe una instrucción antes de consultar la ruta.")
+                if len(instruction) > 8_000:
+                    raise TaskValidationError("La instrucción no puede superar 8000 caracteres.")
+                plan = engine.route_plan(instruction.strip())
+                self._send_json(
+                    200,
+                    {
+                        "task_type": classify_task(instruction.strip()),
+                        "candidates": [asdict(candidate) for candidate in plan],
+                    },
+                )
+                return
+
+            match = re.fullmatch(r"/api/agents/tasks/([0-9a-f]{32})/approve", self.path)
+            if match is None:
+                self._send_json(404, {"error": "Ruta no encontrada."})
+                return
+            engine = self._get_agent_engine()
+            if isinstance(engine, SmartTaskEngine):
+                provider_ids = payload.get("provider_ids")
+                if not isinstance(provider_ids, list) or any(
+                    not isinstance(provider_id, str) for provider_id in provider_ids
+                ):
+                    raise TaskValidationError(
+                        "Selecciona los proveedores permitidos antes de aprobar."
+                    )
+                task = engine.approve_task(
+                    match.group(1),
+                    provider_ids=provider_ids,
+                    external_consent=payload.get("external_consent") is True,
+                )
+                engine.start_worker()
+                self._send_json(202, {"task": asdict(task)})
+                return
+            task = engine.approve_task(match.group(1))
+            self._send_json(200, {"task": asdict(task)})
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            self._send_json(400, {"error": "El cuerpo de la solicitud no es JSON válido."})
+        except TaskValidationError as error:
+            self._send_json(400, {"error": str(error)})
+        except ValueError as error:
+            self._send_json(400, {"error": str(error)})
+        except AgentUnavailable as error:
+            self._send_json(503, {"error": str(error)})
+        except TaskNotFound as error:
+            self._send_json(404, {"error": str(error)})
+        except TaskConflict as error:
+            self._send_json(409, {"error": str(error)})
+        except sqlite3.Error:
+            self._send_json(500, {"error": "No se pudo acceder al historial local de tareas."})
+
+    def _get_agent_engine(self) -> AgentEngine | SmartTaskEngine:
+        if self.agent_engine is None:
+            self.agent_engine = create_smart_engine()
+        return self.agent_engine
+
+    def _agent_response(self) -> dict[str, object]:
+        engine = self._get_agent_engine()
+        return {
+            **engine.public_status(),
+            "tasks": [asdict(task) for task in engine.task_history()],
+        }
+
+    def _session_response(self) -> dict[str, object]:
+        cookies = SimpleCookie()
+        try:
+            cookies.load(self.headers.get("Cookie", ""))
+        except CookieError:
+            cookies = SimpleCookie()
+        cookie = cookies.get("aibridge_csrf")
+        token = (
+            cookie.value
+            if cookie and re.fullmatch(r"[A-Za-z0-9_-]{40,}", cookie.value)
+            else secrets.token_urlsafe(32)
+        )
+        self._csrf_cookie = token
+        return {"csrf_token": token, "authenticated": self._is_authenticated()}
+
+    def _valid_host(self) -> bool:
+        host = self.headers.get("Host", "").lower()
+        allowed_hosts = {
+            urlsplit(origin).netloc.lower() for origin in self.allowed_origins
+        }
+        return bool(host and host in allowed_hosts)
+
+    def _valid_same_origin_request(self) -> bool:
+        origin = urlsplit(self.headers.get("Origin", ""))
+        host = self.headers.get("Host", "")
+        origin_value = f"{origin.scheme}://{origin.netloc}".lower()
+        if (
+            origin.scheme not in {"http", "https"}
+            or origin.path
+            or origin.query
+            or origin.fragment
+            or origin_value not in self.allowed_origins
+            or origin.netloc.lower() != host.lower()
+        ):
+            return False
+
+        cookies = SimpleCookie()
+        try:
+            cookies.load(self.headers.get("Cookie", ""))
+        except CookieError:
+            return False
+        cookie = cookies.get("aibridge_csrf")
+        header_token = self.headers.get("X-CSRF-Token", "")
+        return bool(
+            cookie
+            and re.fullmatch(r"[A-Za-z0-9_-]{40,}", cookie.value)
+            and secrets.compare_digest(cookie.value, header_token)
+        )
+
+    def _is_authenticated(self) -> bool:
+        cookies = SimpleCookie()
+        try:
+            cookies.load(self.headers.get("Cookie", ""))
+        except CookieError:
+            return False
+        cookie = cookies.get("aibridge_session")
+        if cookie is None:
+            return False
+        try:
+            timestamp, nonce, signature = cookie.value.split(".", 2)
+            issued_at = int(timestamp)
+        except (ValueError, TypeError):
+            return False
+        now = int(time.time())
+        if issued_at > now or now - issued_at > 8 * 60 * 60:
+            return False
+        if not re.fullmatch(r"[A-Za-z0-9_-]{40,}", nonce) or not re.fullmatch(
+            r"[0-9a-f]{64}", signature
+        ):
+            return False
+        expected = hmac.new(
+            self.authorization_token.encode("utf-8"),
+            f"{timestamp}.{nonce}".encode("ascii"),
+            "sha256",
+        ).hexdigest()
+        return hmac.compare_digest(signature, expected)
+
+    def _create_session_token(self) -> str:
+        timestamp = str(int(time.time()))
+        nonce = secrets.token_urlsafe(32)
+        signature = hmac.new(
+            self.authorization_token.encode("utf-8"),
+            f"{timestamp}.{nonce}".encode("ascii"),
+            "sha256",
+        ).hexdigest()
+        return f"{timestamp}.{nonce}.{signature}"
+
     def _api_response(self, route: str, query: dict[str, list[str]]) -> object:
         if route == "/api/status":
             snapshot = inspect_repository(self.repository_root)
+            provider = self._get_agent_engine().public_status()["provider"]
             return {
                 "application": "online",
                 "repository": asdict(snapshot),
                 "github": self.github_client.connection_status(),
-                "agents": {
-                    "configured": False,
-                    "message": "No hay un proveedor de agentes configurado.",
-                },
+                "agents": provider,
             }
         if route == "/api/repositories":
             return {"repositories": self.github_client.repositories()}
@@ -85,6 +326,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self._query_value(query, "run_id"),
                 )
             }
+        if route == "/api/agents":
+            return self._agent_response()
+        if route == "/api/session":
+            return self._session_response()
         if route == "/api/files":
             return self._list_files(self._query_value(query, "path", default="."))
         if route == "/api/file":
@@ -194,6 +439,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "default-src 'self'; connect-src 'self'; style-src 'self'; "
             "script-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'",
         )
+        csrf_cookie = getattr(self, "_csrf_cookie", None)
+        auth_cookie = getattr(self, "_auth_cookie", None)
+        secure = (
+            self.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip().lower()
+            == "https"
+        )
+        cookie_attributes = "; HttpOnly; SameSite=Strict; Path=/"
+        if secure:
+            cookie_attributes += "; Secure"
+        if csrf_cookie:
+            self.send_header("Set-Cookie", f"aibridge_csrf={csrf_cookie}{cookie_attributes}")
+        if auth_cookie:
+            self.send_header(
+                "Set-Cookie",
+                f"aibridge_session={auth_cookie}{cookie_attributes}; Max-Age=28800",
+            )
         self.end_headers()
         self.wfile.write(content)
 
@@ -202,6 +463,9 @@ def create_server(
     host: str = "127.0.0.1",
     port: int = 8000,
     github_client: GitHubClient | None = None,
+    agent_engine: AgentEngine | None = None,
+    authorization_token: str | None = None,
+    allowed_origins: frozenset[str] | None = None,
 ) -> ThreadingHTTPServer:
     """Create a dashboard server bound to a specific local repository."""
     repository_root = Path(root).expanduser().resolve()
@@ -214,8 +478,83 @@ def create_server(
         {
             "repository_root": repository_root,
             "github_client": github_client or GitHubClient(),
+            "agent_engine": agent_engine,
+            "authorization_token": authorization_token or secrets.token_urlsafe(32),
+            "allowed_origins": frozenset(),
         },
     )
     server = ThreadingHTTPServer((host, port), handler)
+    try:
+        permitted_origins = _dashboard_origins(host, server.server_port)
+        origins = (
+            permitted_origins
+            if allowed_origins is None
+            else frozenset(origin.lower() for origin in allowed_origins)
+        )
+        if not origins:
+            raise ValueError("No hay orígenes permitidos configurados para el dashboard.")
+        if not origins.issubset(permitted_origins):
+            raise ValueError("Solo se permiten orígenes locales y del Codespace actual.")
+        for origin in origins:
+            parsed = urlsplit(origin)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.netloc
+                or parsed.path
+                or parsed.query
+                or parsed.fragment
+                or parsed.username
+                or parsed.password
+                or "*" in parsed.netloc
+            ):
+                raise ValueError("La lista de orígenes permitidos contiene un valor no válido.")
+        handler.allowed_origins = origins
+    except ValueError:
+        server.server_close()
+        raise
     server.daemon_threads = True
+    server.authorization_token = handler.authorization_token
     return server
+
+
+def _dashboard_origins(host: str, port: int) -> frozenset[str]:
+    origins = {
+        f"http://localhost:{port}",
+        f"http://127.0.0.1:{port}",
+        f"http://[::1]:{port}",
+    }
+    if os.environ.get("CODESPACES", "").lower() == "true":
+        codespace_name = os.environ.get("CODESPACE_NAME", "").strip()
+        forwarding_domain = os.environ.get(
+            "GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN", ""
+        ).strip()
+        if not _is_dns_name(codespace_name, allow_subdomains=False):
+            raise ValueError("CODESPACE_NAME no contiene un nombre válido.")
+        if not _is_dns_name(forwarding_domain):
+            raise ValueError(
+                "GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN no contiene un dominio válido."
+            )
+        origins.add(
+            f"https://{codespace_name.lower()}-{port}.{forwarding_domain.lower()}"
+        )
+    elif host not in {"127.0.0.1", "localhost", "::1"}:
+        raise ValueError(
+            "El dashboard solo puede escuchar en loopback o en un Codespace."
+        )
+    if host in {"127.0.0.1", "localhost", "::1"}:
+        hostname = f"[{host}]" if ":" in host else host
+        origins.add(f"http://{hostname}:{port}")
+    return frozenset(origins)
+
+
+def _is_dns_name(value: str, *, allow_subdomains: bool = True) -> bool:
+    if not value or len(value) > 253:
+        return False
+    labels = value.lower().split(".")
+    if not allow_subdomains and len(labels) != 1:
+        return False
+    return all(
+        re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+        is not None
+        for label in labels
+    )
