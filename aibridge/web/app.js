@@ -557,8 +557,9 @@ async function saveRouterSettings() {
 async function approveAgentTask(task) {
   if (!state.agentData?.providers?.some((item) => item.enabled)) return;
   let candidates;
+  let plan;
   try {
-    const plan = await requestJson("/api/agents/plan", {
+    plan = await requestJson("/api/agents/plan", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import sqlite3
+import threading
 import time
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -46,7 +47,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     repository_root = Path.cwd()
     github_client = GitHubClient()
-    agent_engine: AgentEngine | None = None
+    agent_engine: AgentEngine | SmartTaskEngine | None = None
+    agent_engine_lock = threading.Lock()
     authorization_token = ""
     allowed_origins: frozenset[str] = frozenset()
     web_root = Path(__file__).with_name("web")
@@ -207,9 +209,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": "No se pudo acceder al historial local de tareas."})
 
     def _get_agent_engine(self) -> AgentEngine | SmartTaskEngine:
-        if self.agent_engine is None:
-            self.agent_engine = create_smart_engine()
-        return self.agent_engine
+        handler_class = type(self)
+        with handler_class.agent_engine_lock:
+            if handler_class.agent_engine is None:
+                handler_class.agent_engine = create_smart_engine()
+            return handler_class.agent_engine
 
     def _agent_response(self) -> dict[str, object]:
         engine = self._get_agent_engine()
@@ -458,12 +462,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
+class DashboardHTTPServer(ThreadingHTTPServer):
+    def server_close(self) -> None:
+        engine = self.RequestHandlerClass.agent_engine
+        if isinstance(engine, SmartTaskEngine):
+            engine.stop_worker()
+        super().server_close()
+
+
 def create_server(
     root: str | Path = ".",
     host: str = "127.0.0.1",
     port: int = 8000,
     github_client: GitHubClient | None = None,
-    agent_engine: AgentEngine | None = None,
+    agent_engine: AgentEngine | SmartTaskEngine | None = None,
     authorization_token: str | None = None,
     allowed_origins: frozenset[str] | None = None,
 ) -> ThreadingHTTPServer:
@@ -479,11 +491,12 @@ def create_server(
             "repository_root": repository_root,
             "github_client": github_client or GitHubClient(),
             "agent_engine": agent_engine,
+            "agent_engine_lock": threading.Lock(),
             "authorization_token": authorization_token or secrets.token_urlsafe(32),
             "allowed_origins": frozenset(),
         },
     )
-    server = ThreadingHTTPServer((host, port), handler)
+    server = DashboardHTTPServer((host, port), handler)
     try:
         permitted_origins = _dashboard_origins(host, server.server_port)
         origins = (

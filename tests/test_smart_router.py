@@ -345,6 +345,34 @@ class SmartRouterTests(unittest.TestCase):
         self.assertEqual(retried.status, "approved")
         self.assertEqual(restarted.task_history()[0].id, task.id)
 
+    def test_interrupted_provider_request_is_not_sent_again_after_restart(self):
+        provider = FakeProvider("first", "uncertain response")
+        engine = self.make_engine({"first": provider}, [provider_status("first")])
+        task = engine.create_task("Do not duplicate an uncertain request")
+        engine.approve_task(
+            task.id, provider_ids=["first"], external_consent=True
+        )
+
+        running = engine.store.claim_next()
+        self.assertIsNotNone(running)
+        provider.generate(task.instruction)
+        self.assertEqual(provider.calls, [task.instruction])
+
+        restarted = SmartTaskEngine(
+            SmartTaskStore(self.database_path),
+            {"first": provider},
+            (provider_status("first"),),
+            (),
+        )
+        try:
+            recovered = restarted.store.get(task.id)
+            self.assertEqual(recovered.status, "failed")
+            self.assertIn("vuelve a aprobarla", recovered.error)
+            self.assertEqual(provider.calls, [task.instruction])
+        finally:
+            engine.stop_worker()
+            restarted.stop_worker()
+
     def test_approved_tasks_resume_after_restart(self):
         provider = FakeProvider("first", "resumed response")
         engine = self.make_engine({"first": provider}, [provider_status("first")])

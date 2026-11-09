@@ -1,6 +1,7 @@
 import json
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -11,6 +12,7 @@ from urllib.request import Request, urlopen
 from aibridge.agents import AgentEngine, TaskStore
 from aibridge.dashboard import _dashboard_origins, create_server
 from aibridge.providers import ProviderStatus
+from aibridge.smart_router import SmartTaskEngine, SmartTaskStore
 
 
 class FakeGitHubClient:
@@ -37,6 +39,23 @@ class TestSimulatedProvider:
     def generate(self, instruction):
         self.instructions.append(instruction)
         return f"[SIMULACIÓN] {instruction}"
+
+
+class BlockingSmartProvider:
+    identifier = "simulation"
+    display_name = "Simulación bloqueante"
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.instructions: list[str] = []
+
+    def generate(self, instruction: str) -> str:
+        self.instructions.append(instruction)
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise TimeoutError("La prueba no liberó el proveedor simulado.")
+        return "[SIMULACIÓN] completed"
 
 
 class DashboardHTTPTests(unittest.TestCase):
@@ -81,8 +100,12 @@ class DashboardHTTPTests(unittest.TestCase):
         self.thread.join()
         self.temporary_directory.cleanup()
 
-    def get_json(self, route: str):
-        with urlopen(self.base_url + route) as response:
+    def get_json(self, route: str, *, cookie: str | None = None):
+        request = Request(
+            self.base_url + route,
+            headers={"Cookie": cookie} if cookie is not None else {},
+        )
+        with urlopen(request) as response:
             return json.loads(response.read()), response.headers
 
     def post_json(self, route: str, payload, *, origin=None, csrf=None, cookie=None, host=None):
@@ -325,6 +348,78 @@ class DashboardHTTPTests(unittest.TestCase):
         error.exception.close()
         stored = self.server.RequestHandlerClass.agent_engine.store.get(task["id"])
         self.assertEqual(stored.status, "awaiting_approval")
+
+    def test_agent_engine_is_shared_while_http_task_is_running(self) -> None:
+        provider = BlockingSmartProvider()
+        status = ProviderStatus(
+            identifier="simulation",
+            display_name="Simulación bloqueante",
+            configured=True,
+            enabled=True,
+            simulation=False,
+            message="Solo está disponible en pruebas automatizadas.",
+            model="simulation-test-model",
+            availability="available",
+        )
+        database_path = self.root / ".state" / "smart-tasks.sqlite3"
+        engines: list[SmartTaskEngine] = []
+
+        def create_test_engine() -> SmartTaskEngine:
+            engine = SmartTaskEngine(
+                SmartTaskStore(database_path),
+                {"simulation": provider},
+                (status,),
+                (),
+            )
+            engines.append(engine)
+            return engine
+
+        self.server.RequestHandlerClass.agent_engine = None
+        csrf, cookie = self.authorize_agent()
+        try:
+            with patch("aibridge.dashboard.create_smart_engine", create_test_engine):
+                with self.post_json(
+                    "/api/agents/tasks",
+                    {"instruction": "Keep this task running"},
+                    csrf=csrf,
+                    cookie=cookie,
+                ) as response:
+                    task = json.loads(response.read())["task"]
+
+                with self.post_json(
+                    f"/api/agents/tasks/{task['id']}/approve",
+                    {"provider_ids": ["simulation"], "external_consent": True},
+                    csrf=csrf,
+                    cookie=cookie,
+                ) as response:
+                    self.assertEqual(response.status, 202)
+
+                self.assertTrue(provider.started.wait(timeout=2))
+                observed_statuses = []
+                for _ in range(5):
+                    payload, _ = self.get_json("/api/agents", cookie=cookie)
+                    observed_statuses.append(payload["tasks"][0]["status"])
+                self.assertEqual(observed_statuses, ["running"] * 5)
+
+                provider.release.set()
+                for _ in range(100):
+                    payload, _ = self.get_json("/api/agents", cookie=cookie)
+                    if payload["tasks"][0]["status"] == "completed":
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(payload["tasks"][0]["status"], "completed")
+                self.assertEqual(
+                    payload["tasks"][0]["result"], "[SIMULACIÓN] completed"
+                )
+                self.assertEqual(provider.instructions, ["Keep this task running"])
+                self.assertEqual(len(engines), 1)
+                self.assertIs(
+                    self.server.RequestHandlerClass.agent_engine, engines[0]
+                )
+        finally:
+            provider.release.set()
+            for engine in engines:
+                engine.stop_worker()
 
     def test_dashboard_rejects_untrusted_host_headers(self) -> None:
         malicious_host = "attacker.example"
